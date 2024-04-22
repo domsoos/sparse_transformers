@@ -25,37 +25,19 @@ else:
     print("No GPU available.")
 
 def load_and_process_enwik8(file_path, sequence_length):
-    # Read data
     with open(file_path, 'rb') as f:
         data = bytearray(f.read())
     data = np.array(data, dtype=np.uint8)
     
-    # Split the data into sequences of `sequence_length`
     num_sequences = len(data) // sequence_length
     data = data[:num_sequences * sequence_length]
     data = data.reshape((num_sequences, sequence_length))
     
-    # Convert to torch.Tensor
     data = torch.tensor(data, dtype=torch.long)
     
-    # Create tensor dataset
-    dataset = TensorDataset(data[:, :-1], data[:, 1:])  # Input and target shifted by one position
+    dataset = TensorDataset(data[:, :-1], data[:, 1:])  # input and target shifted by one position for prediction task
     return dataset
 
-
-# Create sparsity pattern
-def create_fixed_window_mask(seq_len, window_size, device):
-    """Create a mask for a fixed-length window attention."""
-    indices = torch.arange(seq_len).unsqueeze(0).to(device)
-    distance = indices - indices.T
-    mask = (distance.abs() > window_size).float() * -1e9  # Large negative for softmax
-    return mask
-
-def create_blockwise_mask(seq_len, block_size, device):
-    """Create a mask for block-wise attention."""
-    indices = torch.arange(seq_len).unsqueeze(0).to(device) // block_size
-    mask = (indices != indices.T).float() * -1e9  # Large negative for softmax
-    return mask
 
 class SparseAttention(nn.Module):
     def __init__(self, embed_size, num_heads, block_size):
@@ -81,15 +63,12 @@ class SparseAttention(nn.Module):
         # Projecting to feature space
         q = torch.einsum('bnhe,ei->bnhi', q, self.feature_projection)
         k = torch.einsum('bnhe,ei->bnhi', k, self.feature_projection)
-
-        # Compute attention scores
-        #scores = torch.einsum('bnhi,bmhi->bnhm', q, k) / math.sqrt(self.head_dim)
-        # Sparse attention
+        
+        # Compute sparse attention scores
         scores = torch.full((B, N, self.num_heads, N), float('-inf'), device=x.device)
         for i in range(0, N, self.block_size):
             scores[:, i:i+self.block_size, :, i:i+self.block_size] = torch.einsum('bnhd,bmhd->bnhm', q[:, i:i+self.block_size], k[:, i:i+self.block_size]) / math.sqrt(self.head_dim)
         
-        #attention = F.softmax(scores, dim=-1)
         attention = F.softmax(scores, dim=-1)
 
         # Apply attention to values
@@ -106,6 +85,7 @@ class TransformerEncoderLayer(nn.Module):
         self.ff = nn.Sequential(
             nn.Linear(embed_size, 4 * embed_size),
             nn.GELU(),
+            nn.Dropout(0.4),
             nn.Linear(4 * embed_size, embed_size)
         )
         
@@ -124,20 +104,19 @@ class TransformerDecoderLayer(nn.Module):
         self.ff = nn.Sequential(
             nn.Linear(embed_size, 4 * embed_size),
             nn.GELU(),
+            nn.Dropout(0.4),
             nn.Linear(4 * embed_size, embed_size)
         )
 
     def forward(self, tgt, memory):
         if memory.size(0) > tgt.size(0):
             memory = memory[:tgt.size(0), :, :]
-        # Ensure tgt and memory are compatible; this might involve padding, masking, or other adjustments
-        # Conceptual adjustment for demonstration; specific logic will depend on your requirements
+        # Ensure tgt and memory are compatible
         if tgt.size(1) != memory.size(1):
             padding = torch.zeros_like(memory[:, :(tgt.size(1) - memory.size(1)), :])
             memory = torch.cat([memory, padding], dim=1)
         tgt_attention = self.sparse_attention(self.norm1(tgt))
-        memory_attention = self.sparse_attention(self.norm2(memory[:, :tgt.size(1), :])) # Adjust memory to match tgt size if necessary
-        #print(f"tgt shape = {tgt.size()}\ntgt_attention shape = {tgt_attention.size()}\nmemory_attention shape = {memory_attention.size()}")
+        memory_attention = self.sparse_attention(self.norm2(memory[:, :tgt.size(1), :]))
         tgt = tgt + tgt_attention + memory_attention
         tgt = tgt + self.ff(self.norm3(tgt))
         return tgt
@@ -169,40 +148,46 @@ class Transformer(nn.Module):
     def total_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-def train(model, criterion, optimizer, data_loader, epoch):
+running_loss = 0
+running_total = 0
+
+def train(model, criterion, optimizer, scheduler, data_loader, epoch, running_loss, running_total, device):
     model.train()
     total_loss, correct, total = 0, 0, 0
     start_time = time.time()
+
     for batch, (src, tgt) in enumerate(data_loader):
         optimizer.zero_grad()
         src = src.to(device)
         tgt = tgt.to(device)
-        output = model(src, tgt[:, :-1])  # Shifted by one for predicting the next token
-        # Adjust the loss calculation
-        #loss = criterion(output.view(-1, num_tokens), tgt[:, 1:].reshape(-1))
-        loss = criterion(output.view(-1, num_tokens), tgt[:, 1:].reshape(-1))  # Ignore the first token of tgt
+        output = model(src, tgt[:, :-1])
+        loss = criterion(output.view(-1, num_tokens), tgt[:, 1:].reshape(-1))
         loss.backward()
         optimizer.step()
-        total_loss += loss.item()
 
-        # Calculate accuracy
+        total_loss += loss.item()
         _, predicted = output.max(-1)
         correct += (predicted == tgt[:, 1:]).view(-1).sum().item()
         total += tgt[:, 1:].numel()
 
-    # Compute average loss and bits per byte
-    avg_loss = total_loss / len(data_loader)
+    scheduler.step()  # Update the learning rate
+
+    running_loss += total_loss
+    running_total += total
+
+    avg_loss = total_loss / len(data_loader) # Average loss per token
+    bits_per_dim = avg_loss / math.log(2)  # Convert to bits
     accuracy = correct / total
     end_time = time.time()
     epoch_duration = end_time - start_time
-    bits_per_byte = avg_loss / math.log(2)
-    print(f'\nEpoch {epoch} | Loss: {avg_loss:.4f} | Accuracy: {accuracy:.4f} \n\t| Bits Per Byte: {bits_per_byte:.2f} | Time: {epoch_duration:.2f}s')
-    return avg_loss, accuracy
 
+    print(f'\tTraining Loss: {total_loss/len(data_loader):.4f} | Accuracy: {accuracy:.4f} | Bits/Dim: {bits_per_dim:.2f} | Time: {epoch_duration:.2f}s')
+    return total_loss / len(data_loader), accuracy
 
-def validate(model, criterion, data_loader):
+def validate(model, criterion, data_loader, running_loss, running_total):
     model.eval()  # Set the model to evaluation mode
     total_loss, total_correct, total_tokens = 0, 0, 0
+    start_time = time.time()
     with torch.no_grad():  # No need to track gradients
         for src, tgt in data_loader:
             src, tgt = src.to(device), tgt.to(device)
@@ -214,16 +199,37 @@ def validate(model, criterion, data_loader):
             _, predictions = torch.max(output, dim=2)  # Get the index of the max log-probability
             correct = (predictions == tgt[:, 1:]).float().sum()  # Compare with ground truth
             total_correct += correct.item()
-            total_tokens += tgt[:, 1:].numel()  # Total number of tokens (for accuracy calculation)
-
+            total_tokens += tgt[:, 1:].numel()  # Total number of tokens
+    running_loss += total_loss
+    running_total += total_tokens
     avg_loss = total_loss / len(data_loader)
     accuracy = total_correct / total_tokens
+    
+    bits_per_dim = avg_loss / math.log(2)
+    accuracy = correct / total_tokens
+    end_time = time.time()
+    epoch_duration = end_time - start_time
+
+    print(f'\tValidation Loss: {avg_loss:.4f} | Accuracy: {accuracy:.4f} | Bits/Dim: {bits_per_dim:.2f} | Time: {epoch_duration:.2f}s')
     return avg_loss, accuracy
+
+
+
+def ensure_cpu_numpy(metric):
+    if torch.is_tensor(metric):
+        if metric.is_cuda:
+            metric = metric.cpu()
+        metric = metric.numpy()
+    elif isinstance(metric, list):
+        return [ensure_cpu_numpy(m) for m in metric]
+    return metric
 
 def plot_metrics(metrics, labels, title, filename):
     epochs = range(1, len(metrics[0]) + 1)
     plt.figure(figsize=(10, 5))
-    for metric, label in zip(metrics, labels):
+    processed_metrics = [ensure_cpu_numpy(metric) for metric in metrics]
+
+    for metric, label in zip(processed_metrics, labels):
         plt.plot(epochs, metric, label=label)
     plt.title(title)
     plt.xlabel('Epochs')
@@ -232,11 +238,14 @@ def plot_metrics(metrics, labels, title, filename):
     plt.savefig(filename)
     plt.close()
 
-sequence_length = 512  # Adjust based on your model's expected input size
+
+sequence_length = 256 
 file_path = './data/enwik8'
 
 # Load and process dataset
 dataset = load_and_process_enwik8(file_path, sequence_length)
+
+print(f"total length of dataset = {len(dataset)}")
 
 # Split dataset into training, validation, and testing
 train_size = int(0.8 * len(dataset))
@@ -244,53 +253,62 @@ val_size = int(0.1 * len(dataset))
 test_size = len(dataset) - train_size - val_size
 train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, val_size, test_size])
 
+print(f"train size = {train_size}")
+print(f"valid size = {val_size}")
+print(f"testi size = {test_size}")
+
 # Create DataLoader instances for each set
-batch_size = 8
+batch_size = 768
 train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 val_dataloader = DataLoader(val_dataset, batch_size=batch_size, drop_last=True)
 test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
 
+print(f"test dataset size = {len(test_dataset)}")
 
-# Device Configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Model Parameters
 embed_size = 256
 num_heads = 8
 epochs = 5
-block_size = 32
-num_layers = 16  # Adjusted for practicality; consider resources
-num_tokens = 256  # We're working with bytes
-max_seq_length = sequence_length  # Adjust according to your setup
-sequence_length = 256
-
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-print(f"device = {device}")
+block_size = 8
+num_layers = 12 
+# original = 30
+num_tokens = 256  
+max_seq_length = sequence_length 
 
 # Instantiate the Model
 model = Transformer(embed_size, num_heads, num_layers, block_size, num_tokens, max_seq_length).to(device)
 print(f"total number of trainable parameters in model: {model.total_parameters}")
-model = nn.DataParallel(model, device_ids=[0, 1]) # Distribute across 2 GPUs
+model = nn.DataParallel(model, device_ids=[0, 1, 2, 3]) # Distribute across 4 GPUs
 
 # Optimizer and Loss Function
-optimizer = Adam(model.parameters(), lr=8e-5)
+# prev_lr = 0.0003
+weight_decay = 0.01
+optimizer = Adam(model.parameters(), lr=0.00035, weight_decay=weight_decay)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
 criterion = nn.CrossEntropyLoss()
 
 #epochs = 5  # Define the number of epochs
 
 losses, accuracies, val_losses, val_accuracies = [], [], [], []
 for epoch in range(1, epochs + 1):
-    train_loss, train_accuracy = train(model, criterion, optimizer, train_dataloader, epoch)
-    val_loss, val_accuracy = validate(model, criterion, val_dataloader)
+    print(f"Epoch {epoch}")
+    train_loss, train_accuracy = train(model, criterion, optimizer, scheduler, train_dataloader, epoch, running_loss, running_total, device)# reset_accumulators=True)#, embed_size,device)
+    val_loss, val_accuracy = validate(model, criterion, val_dataloader, running_loss, running_total)
     # Save metrics
     losses.append(train_loss)
     accuracies.append(train_accuracy)
     val_losses.append(val_loss)
     val_accuracies.append(val_accuracy)
-    print(f'Validation | Loss: {val_loss:.4f} | Accuracy: {val_accuracy:.4f}')
 
-test_loss, test_accuracy = validate(model, criterion, test_dataloader)
+running_loss = 0
+running_total = 0
+
+test_loss, test_accuracy = validate(model, criterion, test_dataloader, running_loss, running_total)
 print(f'Test Loss: {test_loss:.4f} | Test Accuracy: {test_accuracy:.4f}')
+ 
+plot_metrics([losses, val_losses], ['Training Loss', 'Validation Loss'], 'Training and Validation Loss', 'loss_plot_text.png')
+plot_metrics([accuracies, val_accuracies], ['Training Accuracy', 'Validation Accuracy'], 'Training and Validation Accuracy', 'accuracy_plot_text.png')
 
-plot_metrics([losses, val_losses], ['Training Loss', 'Validation Loss'], 'Training and Validation Loss', 'loss_plot.png')
-plot_metrics([accuracies, val_accuracies], ['Training Accuracy', 'Validation Accuracy'], 'Training and Validation Accuracy', 'accuracy_plot.png')
+
